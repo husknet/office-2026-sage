@@ -1,11 +1,5 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  experimental: {
-    appDir: true,
-  },
-  // Enable edge runtime for all routes
-  runtime: 'edge',
-  // Optional: Add headers for CORS
   async headers() {
     return [
       {
